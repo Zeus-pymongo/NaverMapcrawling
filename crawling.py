@@ -23,7 +23,7 @@ MARIADB_STATUS_COLUMN = 'OP_STATUS'
 MONGO_CONFIG = {'host': '192.168.0.222', 'port': 27017, 'username': 'kevin', 'password': 'pass123#', 'db_name': 'jongro'}
 MONGO_COLLECTION = 'restaurant'
 
-NUM_PROCESSES = 2
+NUM_PROCESSES = 3
 
 def get_restaurant_list_from_mariadb():
     """MariaDB에서 '영업' 중인 음식점의 이름과 주소를 가져오는 함수"""
@@ -58,7 +58,6 @@ def get_mongodb_collection():
 def get_already_crawled_list():
     """MongoDB에서 이미 수집된 음식점 목록을 가져오는 함수"""
     collection, client = get_mongodb_collection()
-    # *** 여기가 수정된 부분 ***
     if collection is None:
         return set()
     
@@ -105,7 +104,8 @@ def parse_apollo_data(apollo_data):
         else: data['avg_price'] = 0.0
         return data
     except Exception as e:
-        print(f"   > [WARN] JSON 파싱 중 에러: {e}")
+        # 이 print문은 worker_crawl의 except 블록에서 이미 처리되므로 중복을 피하기 위해 주석 처리하거나 그대로 둘 수 있습니다.
+        # print(f"   > [WARN] JSON 파싱 중 에러: {e}") 
         return None
 
 def worker_crawl(restaurant_info):
@@ -150,15 +150,18 @@ def worker_crawl(restaurant_info):
 
             target_to_click = None
             if dong_info:
-                search_results = WebDriverWait(driver, 5).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, SEARCH_RESULT_LIST_SELECTOR)))[:5]
-                for result in search_results:
-                    try:
-                        naver_address = result.find_element(By.CSS_SELECTOR, SEARCH_RESULT_ADDRESS_SELECTOR).text
-                        if dong_info in naver_address:
-                            target_to_click = result.find_element(By.CSS_SELECTOR, SEARCH_RESULT_LINK_SELECTOR)
-                            break
-                    except NoSuchElementException:
-                        continue
+                try:
+                    search_results = WebDriverWait(driver, 5).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, SEARCH_RESULT_LIST_SELECTOR)))[:5]
+                    for result in search_results:
+                        try:
+                            naver_address = result.find_element(By.CSS_SELECTOR, SEARCH_RESULT_ADDRESS_SELECTOR).text
+                            if dong_info in naver_address:
+                                target_to_click = result.find_element(By.CSS_SELECTOR, SEARCH_RESULT_LINK_SELECTOR)
+                                break
+                        except NoSuchElementException:
+                            continue
+                except TimeoutException:
+                    pass # 검색 결과가 5초 안에 나타나지 않으면 그냥 첫 번째 결과를 클릭하도록 넘어감
             
             if target_to_click:
                 target_to_click.click()
@@ -181,7 +184,7 @@ def worker_crawl(restaurant_info):
             collection.update_one({'original_name': restaurant_name}, {'$set': parsed_data}, upsert=True)
             return parsed_data
         else:
-            return {'original_name': restaurant_name, 'name': cleaned_name, 'status': 'fail', 'reason': 'JSON 파싱 실패'}
+            return {'original_name': restaurant_name, 'name': cleaned_name, 'status': 'fail', 'reason': 'JSON 파싱 실패 (상세 정보 없음)'}
 
     except Exception as e:
         return {'original_name': restaurant_name, 'name': cleaned_name, 'status': 'error', 'reason': str(e)}
@@ -206,9 +209,21 @@ if __name__ == "__main__":
             results = []
             with Pool(processes=NUM_PROCESSES) as pool:
                 with tqdm(total=len(tasks), desc="Crawling Progress") as pbar:
+                    # ========================================================== #
+                    # ============== 여기가 수정된 부분입니다 ============== #
+                    # ========================================================== #
                     for result in pool.imap_unordered(worker_crawl, tasks):
-                        if result and result.get('status') == 'success':
-                            pbar.set_description(f"Crawling Progress (Last: {result.get('name')})")
+                        if result:
+                            # 성공했을 때만 Last 값을 업데이트
+                            if result.get('status') == 'success':
+                                pbar.set_description(f"Crawling Progress (Last: {result.get('name')})")
+                            # 실패했을 때는 그 이유를 화면에 출력
+                            else:
+                                fail_reason = result.get('reason', '알 수 없는 이유')
+                                original_name = result.get('original_name', '알 수 없는 가게')
+                                # tqdm 진행률 표시줄이 깨지지 않도록 줄바꿈 문자를 추가
+                                pbar.write(f"[실패] 가게: {original_name} | 이유: {fail_reason}")
+
                         results.append(result)
                         pbar.update(1)
 
