@@ -21,15 +21,15 @@ MARIADB_ADDRESS_COLUMN = 'DETAIL_ADD'
 MARIADB_STATUS_COLUMN = 'OP_STATUS'
 
 MONGO_CONFIG = {'host': '192.168.0.222', 'port': 27017, 'username': 'kevin', 'password': 'pass123#', 'db_name': 'jongro'}
-MONGO_COLLECTION = 'test'
+MONGO_COLLECTION = 'test'  # 저장할 컬렉션 이름
 
-NUM_PROCESSES = 1
+NUM_PROCESSES = 2 # 동시에 실행할 프로세스 수 (CPU 코어 수에 맞춰 조절)
 
 def get_restaurant_list_from_mariadb():
     """MariaDB에서 '영업' 중인 음식점의 이름과 주소를 가져오는 함수"""
     try:
         conn = pymysql.connect(**MARIADB_CONFIG)
-        query = f"SELECT `{MARIADB_COLUMN}`, `{MARIADB_ADDRESS_COLUMN}` FROM `{MARIADB_TABLE}` WHERE `{MARIADB_STATUS_COLUMN}` LIKE '%영업%' ORDER BY `{MARIADB_ADDRESS_COLUMN}`"
+        query = f"SELECT `{MARIADB_COLUMN}`, `{MARIADB_ADDRESS_COLUMN}` FROM `{MARIADB_TABLE}` WHERE `{MARIADB_STATUS_COLUMN}` LIKE '%영업%'"
         df = pd.read_sql_query(query, conn)
         conn.close()
         print(f"✅ MariaDB에서 '영업' 중인 {len(df)}개의 작업 목록을 성공적으로 가져왔습니다.")
@@ -124,12 +124,10 @@ def parse_apollo_data(apollo_data):
 
         return data
     except Exception as e:
-        # 이 print문은 디버깅 시에만 사용하고, 실제 운영 시에는 주석 처리하거나 로깅으로 대체하는 것이 좋습니다.
-        # print(f"    > [WARN] JSON 파싱 중 에러: {e}")
         return None
 
 def worker_crawl(restaurant_info):
-    """(단일 작업) 음식점 하나를 크롤링하고 MongoDB에 저장하는 함수 (안정성 강화 최종본)"""
+    """(단일 작업) 음식점 하나를 크롤링하고 MongoDB에 저장하는 함수"""
     restaurant_name = restaurant_info[MARIADB_COLUMN]
     restaurant_address = restaurant_info.get(MARIADB_ADDRESS_COLUMN)
 
@@ -200,10 +198,17 @@ def worker_crawl(restaurant_info):
         if parsed_data:
             parsed_data['original_name'] = restaurant_name
             parsed_data['status'] = 'success'
-            collection.update_one({'original_name': restaurant_name}, {'$set': parsed_data}, upsert=True)
+            # ✨ APOLLO_STATE 원본 데이터를 결과에 포함
+            parsed_data['apollo_state'] = apollo_data
+            
+            # MongoDB에 저장할 때는 apollo_state 원본을 제외할 수 있습니다.
+            data_to_save = parsed_data.copy()
+            del data_to_save['apollo_state']
+            
+            collection.update_one({'original_name': restaurant_name}, {'$set': data_to_save}, upsert=True)
             return parsed_data
         else:
-            return {'original_name': restaurant_name, 'name': cleaned_name, 'status': 'fail', 'reason': 'JSON 파싱 실패'}
+            return {'original_name': restaurant_name, 'name': cleaned_name, 'status': 'fail', 'reason': 'JSON 파싱 실패', 'apollo_state': apollo_data}
 
     except Exception as e:
         return {'original_name': restaurant_name, 'name': cleaned_name, 'status': 'error', 'reason': str(e)}
@@ -214,6 +219,7 @@ def worker_crawl(restaurant_info):
 
 if __name__ == "__main__":
     total_list_info = get_restaurant_list_from_mariadb()
+    
     if not total_list_info:
         print("MariaDB에서 작업 목록을 가져오지 못했습니다. 스크립트를 종료합니다.")
     else:
@@ -234,17 +240,36 @@ if __name__ == "__main__":
                         if result and result.get('status') == 'success':
                             pbar.set_description(f"Crawling Progress (Last: {result.get('name')})")
                         else:
-                            # result가 None인 경우에 대한 방어 코드 추가
                             if result:
                                 name = result.get('original_name', '알 수 없는 가게')
                                 reason = result.get('reason', '알 수 없는 오류')
                                 pbar.write(f"[실패] {name}: {reason}")
                             else:
                                 pbar.write(f"[실패] 알 수 없는 가게: worker에서 None을 반환함")
-
                         pbar.update(1)
 
             print("\n--- 모든 병렬 크롤링 작업 완료 ---")
+
+            # --- ✨ APOLLO_STATE 파일 저장 로직 ✨ ---
+            first_success_data = None
+            for r in results:
+                if r and r.get('status') == 'success':
+                    first_success_data = r
+                    break 
+
+            if first_success_data:
+                if 'apollo_state' in first_success_data:
+                    try:
+                        file_name = "apollo_state_dump.json"
+                        with open(file_name, "w", encoding="utf-8") as f:
+                            json.dump(first_success_data['apollo_state'], f, ensure_ascii=False, indent=2)
+                        print(f"✅ 첫 번째 성공 데이터의 APOLLO_STATE를 '{file_name}' 파일로 저장했습니다.")
+                    except Exception as e:
+                        print(f"❌ APOLLO_STATE를 파일로 저장하는 중 오류 발생: {e}")
+                else:
+                    print("⚠️ 성공은 했지만 저장할 APOLLO_STATE 데이터가 결과에 포함되지 않았습니다.")
+            else:
+                print("⚠️ 크롤링에 성공한 데이터가 없어 APOLLO_STATE 파일을 저장할 수 없습니다.")
 
             success_count = sum(1 for r in results if r and r.get('status') == 'success')
             fail_count = len(results) - success_count
